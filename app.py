@@ -10,8 +10,7 @@ DEFAULT_CSV = APP_DIR / "data" / "chouka.csv"
 JMA_CSV = APP_DIR / "data" / "data.csv"
 
 TARGET = "竿頭(宝来丸)"
-OTHER_TARGET = "竿頭(飛翔)"
-REQUIRED = ["日付", "潮回り", TARGET, OTHER_TARGET, "潮の速さ", "月", "天気", "波高", "風速", "気温"]
+REQUIRED = ["日付", "潮回り", TARGET, "潮の速さ", "月", "天気", "波高", "風速", "気温"]
 
 TIDE_ORDER = ["大潮", "中潮", "小潮", "長潮", "若潮"]
 WEATHER_OPTIONS = ["晴", "曇", "雨", "晴曇", "曇晴", "雨曇", "雨晴", "晴雨", "不明"]
@@ -52,11 +51,6 @@ def find_column(df, wanted):
         for c in df.columns:
             n = normalize_header(c)
             if "竿頭" in n and "宝来丸" in n:
-                return c
-    if wanted == OTHER_TARGET:
-        for c in df.columns:
-            n = normalize_header(c)
-            if "竿頭" in n and ("飛翔" in n or "飛龍" in n):
                 return c
     return None
 
@@ -139,7 +133,6 @@ def fetch_jma_val(date_str, cache_dict):
 def normalize_columns(df):
     aliases = {
         TARGET: [TARGET, "竿頭（宝来丸）", "竿頭(宝来丸) ", "竿頭（宝来丸） "],
-        OTHER_TARGET: [OTHER_TARGET, "竿頭（飛翔）", "竿頭(飛龍)", "竿頭（飛龍）", "竿頭(飛翔) ", "竿頭（飛翔） "],
     }
     rename = {}
     cols = {str(c).strip(): c for c in df.columns}
@@ -180,7 +173,6 @@ def prepare(df):
     df["気温"] = df["気温"].fillna(22.0)
     df["月"] = to_number(df["月"])
     df[TARGET] = to_number(df[TARGET])
-    df[OTHER_TARGET] = to_number(df[OTHER_TARGET])
     for c in ["潮の速さ", "天気", "潮回り"]:
         df[c] = df[c].map(clean).replace("", "不明")
     df["月齢帯"] = df["月"].map(moon_band)
@@ -219,21 +211,13 @@ def parse_count_series(series):
     )
 
 
-def analysis_frame(df, include_other=False):
-    parts = []
-    if TARGET in df.columns:
-        x = df.copy()
-        x["釣果"] = parse_count_series(x[TARGET])
-        x["船"] = "宝来丸"
-        parts.append(x)
-    if include_other and OTHER_TARGET in df.columns:
-        x = df.copy()
-        x["釣果"] = parse_count_series(x[OTHER_TARGET])
-        x["船"] = "飛翔"
-        parts.append(x)
-    if not parts:
+def analysis_frame(df):
+    if TARGET not in df.columns:
         return pd.DataFrame()
-    return pd.concat(parts, ignore_index=True).dropna(subset=["釣果"])
+    x = df.copy()
+    x["釣果"] = parse_count_series(x[TARGET])
+    x["船"] = "宝来丸"
+    return x.dropna(subset=["釣果"])
 
 
 def probability(df, mask):
@@ -285,8 +269,8 @@ def similarity(row, inp):
     return score
 
 
-def predict(df, inp, include_other=False):
-    v = analysis_frame(df, include_other)
+def predict(df, inp):
+    v = analysis_frame(df)
     if v.empty:
         return None
     scored = [(idx, similarity(r, inp)) for idx, r in v.iterrows()]
@@ -329,12 +313,11 @@ def predict(df, inp, include_other=False):
         confidence = min(confidence, 97.0)
         
     return dict(p20=p20, p30=p30, p40=p40, mean=mean, low=q25, high=q75,
-                confidence=confidence, rows=rows, scored=scored, exact=ex,
-                include_other=include_other)
+                confidence=confidence, rows=rows, scored=scored, exact=ex)
 
 
-def make_ranking(df, min_n=3, include_other=False):
-    base = analysis_frame(df, include_other)
+def make_ranking(df, min_n=3):
+    base = analysis_frame(df)
     if base.empty:
         return []
     fields = ["潮回り", "月齢帯", "潮の速さ", "天気"]
@@ -365,7 +348,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="hero"><h1>🦑 三国沖 イカメタル釣果予測</h1><p>宝来丸・飛翔の過去釣果と気象庁の風速・気温データから高精度予測</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>🦑 三国沖 イカメタル釣果予測</h1><p>宝来丸の過去釣果と気象庁の風速・気温データから高精度予測</p></div>', unsafe_allow_html=True)
 
 # セッション内データ初期化
 if "df" not in st.session_state:
@@ -384,10 +367,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"CSV読込エラー：{e}")
             
-    include_other = st.checkbox("飛翔（隣船）の釣果も予測に含める", value=False)
-    st.caption("ON：宝来丸＋飛翔 / OFF：宝来丸のみ")
     st.divider()
-    
     wind_c, temp_c = load_jma_cache()
     jma_status = "有効 (data/data.csv)" if (wind_c or temp_c) else "未検出"
     st.caption(f"気象庁データ連携: {jma_status}")
@@ -418,7 +398,7 @@ with c3:
 inp = {"tide": tide, "moon": moon, "weather": weather, "speed": speed, "wave": wave, "wind": wind, "temp": temp}
 
 if st.button("🔍 釣果を予測する", type="primary", use_container_width=True):
-    r = predict(df, inp, include_other=include_other)
+    r = predict(df, inp)
     if r is None:
         st.warning("分析できる釣果データがありません。")
     else:
@@ -427,7 +407,7 @@ if st.button("🔍 釣果を予測する", type="primary", use_container_width=T
 
 if "result" in st.session_state:
     r = st.session_state.result
-    st.subheader(f"📅 {st.session_state.result_date:%Y/%m/%d} の予測結果")
+    st.subheader(f"📅 {st.session_state.result_date:%Y/%m/%d} の予測結果（宝来丸）")
     a, b, c, d = st.columns(4)
     a.metric("20杯以上", f"{r['p20']:.0f}%")
     b.metric("30杯以上", f"{r['p30']:.0f}%")
@@ -436,8 +416,7 @@ if "result" in st.session_state:
     st.progress(min(1.0, r["confidence"] / 100))
     st.caption(f"信頼度 {r['confidence']:.0f}/100 ※類似件数や条件一致度から算出した指標")
 
-    mode = "宝来丸＋飛翔" if include_other else "宝来丸のみ"
-    st.write(f"**分析対象：** {mode} ｜ **入力：** {tide} × 月齢{moon:.1f} × {weather} × 潮速:{speed} × 波高{wave}m × 風速{wind}m/s × 気温{temp}℃")
+    st.write(f"**分析対象：** 宝来丸 ｜ **入力：** {tide} × 月齢{moon:.1f} × {weather} × 潮速:{speed} × 波高{wave}m × 風速{wind}m/s × 気温{temp}℃")
     if r["exact"]:
         st.info(f"★ 近接条件一致: {r['exact']['n']}件 / 20杯以上 {r['exact']['p20']:.1f}%")
 
@@ -454,8 +433,8 @@ st.divider()
 
 rank_tab, data_tab = st.tabs(["📊 条件ランキング", "📁 データ"])
 with rank_tab:
-    st.subheader("釣れやすい条件ランキング")
-    ranking = make_ranking(df, include_other=include_other)
+    st.subheader("釣れやすい条件ランキング（宝来丸）")
+    ranking = make_ranking(df)
     if not ranking:
         st.info("3件以上そろった完全一致条件がまだありません。")
     else:
@@ -468,6 +447,6 @@ with rank_tab:
 with data_tab:
     st.subheader("読み込んだCSVデータ")
     st.write(f"**ファイル：** {st.session_state.source} ｜ **日数：** {len(df)}")
-    display_cols = [c for c in ["日付", "潮回り", TARGET, "船中合計", "人数", OTHER_TARGET, "潮の速さ", "月", "天気", "波高", "風速", "気温"] if c in df.columns]
-    st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+    # データ画面ではすべての列（飛龍などのデータも含めて）そのまま確認できるように表示します
+    st.dataframe(df, use_container_width=True, hide_index=True)
     st.caption("※風速・気温が空欄の日は `data/data.csv` の18〜23時平均データから自動補完されています。")
