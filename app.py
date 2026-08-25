@@ -348,7 +348,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="hero"><h1>🦑 三国沖 イカメタル釣果予測</h1><p>宝来丸の過去釣果と気象庁の風速・気温データから高精度予測</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>🦑 宝来丸 イカメタル釣果予測</h1><p>宝来丸の過去釣果と気象庁の風速・気温データから高精度予測</p></div>', unsafe_allow_html=True)
 
 # セッション内データ初期化
 if "df" not in st.session_state:
