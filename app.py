@@ -16,7 +16,7 @@ TIDE_ORDER = ["大潮", "中潮", "小潮", "長潮", "若潮"]
 WEATHER_OPTIONS = ["晴", "曇", "雨", "晴曇", "曇晴", "雨曇", "雨晴", "晴雨", "不明"]
 SPEED_OPTIONS = ["緩い", "普通", "速い", "カッ飛び", "不明"]
 
-st.set_page_config(page_title="三国沖 イカメタル釣果予測", page_icon="🦑", layout="wide")
+st.set_page_config(page_title="宝来丸 イカメタル釣果予測", page_icon="🦑", layout="wide")
 
 
 def clean(v):
