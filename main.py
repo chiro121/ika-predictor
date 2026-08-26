@@ -16,7 +16,26 @@ OTHER_TARGET = "竿頭(飛翔)"
 REQUIRED = ["日付", "潮回り", TARGET, OTHER_TARGET, "潮の速さ", "天気", "波高", "風速", "気温"]
 
 TIDE_ORDER = ["大潮","中潮","小潮","長潮","若潮"]
-WEATHER_OPTIONS = ["晴","曇","雨","晴曇","曇晴","雨曇","雨晴","晴雨","不明"]
+WEATHER_OPTIONS = [
+    "晴",
+    "曇",
+    "雨",
+
+    # 2パターン
+    "晴曇", "曇晴",
+    "晴雨", "雨晴",
+    "曇雨", "雨曇",
+
+    # 3パターン
+    "晴曇雨",
+    "晴雨曇",
+    "曇晴雨",
+    "曇雨晴",
+    "雨晴曇",
+    "雨曇晴",
+
+    "不明"
+]
 SPEED_OPTIONS = ["緩い","普通","速い","カッ飛び","不明"]
 
 
@@ -264,16 +283,21 @@ def get_weather_pattern(df, date_value, current_weather):
 
 def weather_sequence(weather):
     """
+    天気を構成要素に分解する。
+
     晴曇雨 → ["晴", "曇", "雨"]
+    雨→雨曇 → ["雨", "雨", "曇"]
     雲 → ["曇"]
     """
+
     weather = normalize_weather(weather)
 
     if not weather:
         return []
 
-    return list(weather)
+    weather = weather.replace("→", "")
 
+    return list(weather)
 
 def classify_weather_change(previous, current):
     """
@@ -392,7 +416,7 @@ def weather_pattern_score(df, pattern, include_other=False):
     for _, row in work.iterrows():
         date = row["日付"]
 
-        info = get_weather_pattern(df, date)
+        info = get_weather_pattern(df, date,row["天気"])
 
         if info["pattern"] == pattern:
             matches.append(row["釣果"])
@@ -411,33 +435,153 @@ def weather_pattern_score(df, pattern, include_other=False):
 
     return 10 * p20 * sample_factor
 
-def similarity(row, inp, df=None):
+def weather_pattern_score(target_pattern, row_pattern):
+    """
+    天気パターンの近さを0〜10点で評価。
+
+    例：
+    雨→雨曇 と 雨→雨曇 = 10点
+    雨→雨曇 と 雨→曇   = 8点
+    雨→雨曇 と 曇→雨曇 = 7点
+    雨→雨曇 と 曇→曇   = 5点
+    大きく違う場合 = 0点
+    """
+
+    if not target_pattern or not row_pattern:
+        return 0
+
+    target = weather_sequence(target_pattern)
+    row = weather_sequence(row_pattern)
+
+    if not target or not row:
+        return 0
+
+    # ① パターン完全一致
+    if target == row:
+        return 10
+
+    # 前半（前日の天気）の近さ
+    first_score = 0
+    if target[0] == row[0]:
+        first_score = 5
+    elif weather_close(target[0], row[0]):
+        first_score = 4
+
+    # 後半（当日の天気）の近さ
+    last_score = 0
+    if target[-1] == row[-1]:
+        last_score = 5
+    elif weather_close(target[-1], row[-1]):
+        last_score = 4
+
+    # 変化の方向が同じなら少し加点
+    target_change = weather_change_type(target)
+    row_change = weather_change_type(row)
+
+    change_bonus = 0
+
+    if target_change == row_change:
+        change_bonus = 1
+
+    score = first_score + last_score + change_bonus
+
+    return min(score, 9)
+
+def weather_close(a, b):
+    """
+    天気そのものの近さ。
+
+    晴・曇・雨の3種類を、
+    「似ている天気」として判定する。
+    """
+
+    a = clean(a)
+    b = clean(b)
+
+    if a == b:
+        return True
+
+    # 「晴曇」「曇晴」など複合天気を構成要素として扱う
+    a_set = set(weather_sequence(a))
+    b_set = set(weather_sequence(b))
+
+    if not a_set or not b_set:
+        return False
+
+    # 共通する天気があれば近いと判定
+    return len(a_set & b_set) > 0
+
+def weather_change_type(seq):
+    """
+    天気の変化方向を判定。
+
+    晴→曇 ＝ 悪化
+    雨→曇 ＝ 回復
+    晴→晴 ＝ 安定
+    """
+
+    if not seq:
+        return "不明"
+
+    if len(seq) == 1:
+        return "安定"
+
+    first = seq[0]
+    last = seq[-1]
+
+    if first == last:
+        return "安定"
+
+    bad = {"晴": 0, "曇": 1, "雨": 2}
+
+    if first in bad and last in bad:
+        if bad[last] > bad[first]:
+            return "悪化"
+        elif bad[last] < bad[first]:
+            return "回復"
+
+    return "変化"
+
+def similarity(row, inp, df=None, return_detail=False):
     s = 0
+
+    detail = {
+        "潮回り": 0,
+        "月齢": 0,
+        "潮速": 0,
+        "天気": 0,
+        "天気変化": 0,
+        "風速": 0,
+        "気温": 0
+    }
 
     # ① 潮回り
     if clean(row["潮回り"]) == inp["tide"]:
-        s += 30
+        detail["潮回り"] = 10
+        s += 10
 
     # ② 月齢
     if pd.notna(row["月"]):
         d = abs(float(row["月"]) - inp["moon"])
 
         if d <= 1.5:
+            detail["月齢"] = 10
             s += 25
         elif d <= 3:
+            detail["月齢"] = 5
             s += 15
 
     # ③ 潮の速さ
     if clean(row["潮の速さ"]) == inp["speed"]:
+        detail["潮速"] = 10
         s += 15
 
     # ④ 当日の天気
     if clean(row["天気"]) == inp["weather"]:
+        detail["天気"] = 10
         s += 10
 
     # ⑤ 前日→当日の天気変化
-    # 過去データの「前日→当日」と
-    # 今回の予測日の「前日→当日」が一致したら加点
     if df is not None:
         target_pattern = inp.get("weather_pattern", "")
 
@@ -448,8 +592,62 @@ def similarity(row, inp, df=None):
                 row["天気"]
             )["pattern"]
 
-            if row_pattern == target_pattern:
-                s += 10
+            weather_score = weather_pattern_score(
+                target_pattern,
+                row_pattern
+            ) * 1.5
+
+            detail["天気変化"] = weather_score
+            s += weather_score
+    # ⑥ 波高
+    if pd.notna(row.get("波高")) and pd.notna(inp.get("wave")):
+        diff = abs(float(row["波高"]) - float(inp["wave"]))
+
+        if diff <= 0.2:
+            detail["波高"] = 15
+        elif diff <= 0.5:
+            detail["波高"] = 10
+        elif diff <= 1.0:
+            detail["波高"] = 5
+        else:
+            detail["波高"] = 0
+
+        s += detail["波高"]\
+    
+    # ⑦ 風速
+    if pd.notna(row.get("風速")) and pd.notna(inp.get("wind")):
+        diff = abs(float(row["風速"]) - float(inp["wind"]))
+
+        if diff <= 0.5:
+            detail["風速"] = 20
+        elif diff <= 1.0:
+            detail["風速"] = 15
+        elif diff <= 2.0:
+            detail["風速"] = 10
+        elif diff <= 3.0:
+            detail["風速"] = 5
+        else:
+            detail["風速"] = 0
+
+        s += detail["風速"]
+
+    # ⑧ 気温
+    if pd.notna(row.get("気温")) and pd.notna(inp.get("temp")):
+        diff = abs(float(row["気温"]) - float(inp["temp"]))
+
+        if diff <= 1:
+            detail["気温"] = 10
+        elif diff <= 2:
+            detail["気温"] = 7
+        elif diff <= 4:
+            detail["気温"] = 4
+        else:
+            detail["気温"] = 0
+
+        s += detail["気温"]
+
+    if return_detail:
+        return s, detail
 
     return s
 
@@ -457,12 +655,22 @@ def predict(df, inp, include_other=False):
     v = analysis_frame(df, include_other)
     if v.empty: return None
     inp["include_other"] = include_other    
-    scored = [
-        (idx, similarity(r, inp, df))
-        for idx, r in v.iterrows()]
-    scored = sorted(scored, key=lambda x:x[1], reverse=True)[:10]
+    scored = []
+
+    for idx, r in v.iterrows():
+        score, detail = similarity(
+            r,
+            inp,
+            df,
+            return_detail=True
+        )
+        scored.append((idx, score, detail))
+    scored = sorted(scored, key=lambda x: x[1], reverse=True)[:10]
     rows = v.loc[[x[0] for x in scored]]
-    w = np.array([max(1,x[1]) for x in scored], dtype=float)
+    w = np.array(
+        [max(1, x[1]) for x in scored],
+        dtype=float
+    )
     y = rows["釣果"].to_numpy(float)
     p20 = np.average((y>=20).astype(float), weights=w)*100
     p30 = np.average((y>=30).astype(float), weights=w)*100
@@ -523,7 +731,7 @@ def make_ranking(df, min_n=3, include_other=False):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("🦑 三国沖 イカメタル釣果予測（気象庁CSV連携・気温対応）")
+        self.title("🦑 宝来丸 イカメタル釣果予測（気象庁CSV連携・気温対応）")
         self.geometry("1120x820"); self.minsize(980,700); self.configure(bg="#F5F7FA")
         self.df=pd.DataFrame(); self.csv_path=None
         
@@ -547,7 +755,7 @@ class App(tk.Tk):
 
     def build(self):
         h=tk.Frame(self,bg="#172033",height=82); h.pack(fill="x")
-        tk.Label(h,text="🦑 三国沖 イカメタル釣果予測",bg="#172033",fg="white",
+        tk.Label(h,text="🦑 宝来丸 イカメタル釣果予測",bg="#172033",fg="white",
                  font=("Yu Gothic UI",22,"bold")).pack(side="left",padx=28,pady=18)
         self.file_label=tk.Label(h,text="CSV: 未読込",bg="#172033",fg="#B9C2D0",font=("Yu Gothic UI",10))
         self.file_label.pack(side="right",padx=28)
@@ -571,7 +779,6 @@ class App(tk.Tk):
             "temp": tk.StringVar(value="22.0")
         }
 
-        self.include_other=tk.BooleanVar(value=False)
         fields=[
             ("予測日","date",None),
             ("潮回り","tide",TIDE_ORDER),
@@ -610,10 +817,6 @@ class App(tk.Tk):
                 )
             w.pack(side="right")
             
-        cb=tk.Checkbutton(left,text="飛翔（飛龍）の釣果も予測に含める",variable=self.include_other,command=self.refresh_rank,
-                          bg="white",fg="#2B3445",activebackground="white",font=("Yu Gothic UI",10),selectcolor="white")
-        cb.pack(anchor="w",padx=20,pady=(8,2))
-        tk.Label(left,text="☑ 宝来丸＋飛翔をまとめて分析\n☐ 宝来丸だけで分析",bg="white",fg="#7A8494",justify="left",font=("Yu Gothic UI",9)).pack(anchor="w",padx=20,pady=(0,10))
         ttk.Button(left,text="🔍 釣果を予測する",command=self.do_predict).pack(fill="x",padx=20,pady=(6,18))
         
         tk.Label(right,text="予測結果",bg="#F5F7FA",fg="#172033",font=("Yu Gothic UI",18,"bold")).pack(anchor="w",pady=(0,12))
@@ -678,7 +881,7 @@ class App(tk.Tk):
     def refresh_rank(self):
         if self.df.empty:return
         self.rt.delete(*self.rt.get_children())
-        for cond,n,p,adj,avg in make_ranking(self.df, include_other=self.include_other.get()):
+        for cond,n,p,adj,avg in make_ranking(self.df,include_other=False):
             self.rt.insert("", "end",values=(cond,n,f"{adj:.1f}%",f"{adj:.1f}",f"{avg:.1f}"))
 
     def do_predict(self):
@@ -702,11 +905,11 @@ class App(tk.Tk):
         inp={"tide":self.vars["tide"].get(),"moon":moon,"weather":self.vars["weather"].get(),
              "speed":self.vars["speed"].get(),"wave":wave,"wind":wind,"temp":temp,"previous_weather": weather_info["previous"],"weather_pattern": weather_info["pattern"],"weather_change": weather_info["change_type"]}
              
-        r=predict(self.df,inp,include_other=self.include_other.get())
+        r=predict(self.df, inp, include_other=False)
         self.p20.config(text=f"{r['p20']:.0f}%"); self.mean.config(text=f"{r['low']:.0f}〜{r['high']:.0f}杯")
         stars=max(1,min(5,round(r["confidence"]/20))); self.conf.config(text="★"*stars+"☆"*(5-stars))
         self.text.delete("1.0","end")
-        mode="宝来丸＋飛翔" if self.include_other.get() else "宝来丸のみ"
+        mode="宝来丸"
         
         self.text.insert(
             "end",
@@ -730,13 +933,60 @@ class App(tk.Tk):
         if r["exact"]:
             e=r["exact"]; self.text.insert("end",f"\n★ 近接条件一致: {e['n']}件 / 20杯以上 {e['p20']:.1f}%\n")
             
-        self.text.insert("end","\n🔎 似ている過去データ（風速・気温考慮）\n"+"-"*75+"\n")
-        for idx,score in r["scored"]:
-            x=r["rows"].loc[idx]
-            wave_val = f"波{float(x['波高']):.1f}m" if pd.notna(x['波高']) else "波不明"
-            wind_val = f"風{float(x['風速']):.1f}m" if pd.notna(x['風速']) else "風不明"
-            temp_val = f"気温{float(x['気温']):.1f}℃" if pd.notna(x['気温']) else "気温不明"
-            self.text.insert("end",f"{clean(x['日付']):12} {clean(x['船']):5} {clean(x['潮回り']):4} 月{float(x['月']):4.1f} {wave_val:7} {wind_val:8} {temp_val:9} → {x['釣果']:.0f}杯（{score}点）\n")
+        self.text.insert("end","\n🔎 似ている過去データ\n" + "-" * 100 + "\n")
+
+        for idx, score, detail in r["scored"]:
+            x = r["rows"].loc[idx]
+            date = clean(x.get("日付", ""))
+            tide = clean(x.get("潮回り", ""))
+            weather = clean(x.get("天気", ""))
+            speed = clean(x.get("潮の速さ", ""))
+            # 過去データの前日→当日の天気パターン
+            weather_info = get_weather_pattern(
+                self.df,
+                x["日付"],
+                x["天気"]
+            )
+
+            weather_pattern = weather_info.get("pattern", "")
+            moon = ""
+            if pd.notna(x.get("月")):
+                moon = f"{float(x['月']):.1f}"
+
+            catch = x["釣果"]
+
+            wind_value = ""
+            if pd.notna(x.get("風速")):
+                wind_value = f"{float(x['風速']):.1f}"
+
+            temp_value = ""
+            if pd.notna(x.get("気温")):
+                temp_value = f"{float(x['気温']):.1f}"
+
+            self.text.insert(
+                "end",
+                f"{date:12} "
+                f"{tide:4} "
+                f"月{moon:4} "
+                f"天気:{weather:6} "
+                f"天気変化:{weather_pattern:8} "
+                f"潮:{speed:4} "
+                f"風速:{wind_value:4} "
+                f"気温:{temp_value:4}℃ "
+                f"→ {catch:.0f}杯 "
+                f"（{score}点）\n"
+            )
+            self.text.insert(
+                "end",
+                f"    └ 内訳："
+                f"潮回り {detail['潮回り']}点 / "
+                f"月齢 {detail['月齢']}点 / "
+                f"潮速 {detail['潮速']}点 / "
+                f"天気 {detail['天気']}点 / "
+                f"天気変化 {detail['天気変化']}点 / "
+                f"風速 {detail['風速']}点 / "
+                f"気温 {detail['気温']}点\n"
+            )
             
         self.text.insert("end","\n※風速・気温欄が空欄の日付は、data/data.csv（18〜23時）から自動算出・補完しています。")
 
