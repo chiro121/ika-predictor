@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime
 import pandas as pd
 import numpy as np
+from tkcalendar import DateEntry
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CSV = APP_DIR / "data" / "chouka.csv"
@@ -12,7 +13,7 @@ JMA_CSV = APP_DIR / "data" / "data.csv"
 TARGET = "竿頭(宝来丸)"
 OTHER_TARGET = "竿頭(飛翔)"
 # 必須列に気温を追加（CSV側にない場合は空欄になります）
-REQUIRED = ["日付", "潮回り", TARGET, OTHER_TARGET, "潮の速さ", "月", "天気", "波高", "風速", "気温"]
+REQUIRED = ["日付", "潮回り", TARGET, OTHER_TARGET, "潮の速さ", "天気", "波高", "風速", "気温"]
 
 TIDE_ORDER = ["大潮","中潮","小潮","長潮","若潮"]
 WEATHER_OPTIONS = ["晴","曇","雨","晴曇","曇晴","雨曇","雨晴","晴雨","不明"]
@@ -21,6 +22,36 @@ SPEED_OPTIONS = ["緩い","普通","速い","カッ飛び","不明"]
 
 def clean(v):
     return "" if pd.isna(v) else str(v).strip()
+
+def normalize_weather(weather):
+    """
+    天気表記を統一する。
+    「雲」と「曇」は同じ扱い。
+    """
+    weather = clean(weather)
+
+    if not weather:
+        return ""
+
+    return weather.replace("雲", "曇")
+
+def calculate_moon_age(date_value):
+    """
+    日付から月齢を概算する。
+    2000/1/6 18:14 UTC付近の新月を基準に29.530588日の周期で計算。
+    """
+    try:
+        dt = pd.to_datetime(date_value)
+
+        # 日本時間の日付として扱う
+        reference = pd.Timestamp("2000-01-07 03:14")
+
+        days = (dt - reference).total_seconds() / 86400
+        moon_age = days % 29.530588
+
+        return moon_age
+    except Exception:
+        return np.nan
 
 def moon_band(m):
     if pd.isna(m): return "不明"
@@ -164,15 +195,132 @@ def prepare(df):
                 
     df["風速"] = df["風速"].fillna(2.5)
     df["気温"] = df["気温"].fillna(20.0)  # デフォルト気温目安
-    df["月"] = _to_number(df["月"])
+    df["月"] = df["日付"].map(calculate_moon_age)
     df[TARGET] = _to_number(df[TARGET])
     
     for c in ["潮の速さ","天気","潮回り"]:
         df[c] = df[c].map(clean)
+
+    df["天気"] = df["天気"].map(normalize_weather)
+
     df["潮の速さ"] = df["潮の速さ"].replace("", "不明")
     df["天気"] = df["天気"].replace("", "不明")
     df["月齢帯"] = df["月"].map(moon_band)
     return df
+
+def get_weather_pattern(df, date_value, current_weather):
+    """
+    前日の天気はCSVから取得。
+    当日の天気は予測条件として入力されたものを使用。
+    """
+
+    try:
+        target_date = pd.to_datetime(date_value).normalize()
+    except Exception:
+        return {
+            "previous": "",
+            "current": normalize_weather(current_weather),
+            "pattern": "",
+            "change_type": "不明"
+        }
+
+    work = df.copy()
+    work["_date"] = pd.to_datetime(
+        work["日付"],
+        errors="coerce"
+    ).dt.normalize()
+
+    daily = {}
+
+    for _, row in work.sort_values("_date").iterrows():
+        d = row["_date"]
+
+        if pd.isna(d):
+            continue
+
+        weather = normalize_weather(row.get("天気", ""))
+
+        if weather and weather != "不明":
+            daily[d] = weather
+
+    previous_date = target_date - pd.Timedelta(days=1)
+
+    previous = daily.get(previous_date, "")
+    current = normalize_weather(current_weather)
+
+    if previous and current:
+        pattern = f"{previous}→{current}"
+    elif current:
+        pattern = current
+    else:
+        pattern = ""
+
+    return {
+        "previous": previous,
+        "current": current,
+        "pattern": pattern,
+        "change_type": classify_weather_change(previous, current)
+    }
+
+def weather_sequence(weather):
+    """
+    晴曇雨 → ["晴", "曇", "雨"]
+    雲 → ["曇"]
+    """
+    weather = normalize_weather(weather)
+
+    if not weather:
+        return []
+
+    return list(weather)
+
+
+def classify_weather_change(previous, current):
+    """
+    前日→当日の天気変化を分類する。
+
+    「安定」だけを良いとは扱わない。
+    実際の釣果データから天気パターンごとの傾向を学習するため、
+    これは説明用の分類。
+    """
+
+    if not previous or not current:
+        return "不明"
+
+    p = weather_sequence(previous)
+    c = weather_sequence(current)
+
+    if not p or not c:
+        return "不明"
+
+    # 最終的な天気が同じ
+    if p[-1] == c[-1]:
+        if p == c:
+            return "安定"
+        return "小変化"
+
+    # 晴→曇、曇→雨など
+    worsening = {
+        ("晴", "曇"),
+        ("晴", "雨"),
+        ("曇", "雨")
+    }
+
+    improving = {
+        ("雨", "曇"),
+        ("雨", "晴"),
+        ("曇", "晴")
+    }
+
+    pair = (p[-1], c[-1])
+
+    if pair in worsening:
+        return "悪化"
+
+    if pair in improving:
+        return "回復"
+
+    return "変化"
 
 def normalize_columns(df):
     aliases = {
@@ -224,37 +372,94 @@ def probability(df, mask):
         "median": x.median()
     }
 
-def similarity(row, inp):
+def weather_pattern_score(df, pattern, include_other=False):
+    """
+    過去データから天気パターンの実績を評価する。
+
+    サンプルが少ない場合はスコアを弱くする。
+    """
+
+    if not pattern:
+        return 0
+
+    work = analysis_frame(df, include_other)
+
+    if work.empty:
+        return 0
+
+    matches = []
+
+    for _, row in work.iterrows():
+        date = row["日付"]
+
+        info = get_weather_pattern(df, date)
+
+        if info["pattern"] == pattern:
+            matches.append(row["釣果"])
+
+    n = len(matches)
+
+    if n == 0:
+        return 0
+
+    # 20杯以上率
+    p20 = np.mean(np.array(matches) >= 20)
+
+    # 最大10点
+    # サンプルが少ないほど弱くする
+    sample_factor = min(1.0, n / 8)
+
+    return 10 * p20 * sample_factor
+
+def similarity(row, inp, df=None):
     s = 0
-    if clean(row["潮回り"]) == inp["tide"]: s += 15
+
+    # ① 潮回り
+    if clean(row["潮回り"]) == inp["tide"]:
+        s += 30
+
+    # ② 月齢
     if pd.notna(row["月"]):
         d = abs(float(row["月"]) - inp["moon"])
-        if d <= 1.5: s += 15
-        elif d <= 3: s += 8
-    if clean(row["潮の速さ"]) == inp["speed"]: s += 15
-    if clean(row["天気"]) == inp["weather"]: s += 10
-    
-    if pd.notna(row["波高"]):
-        h_diff = abs(float(row["波高"]) - inp["wave"])
-        if h_diff <= 0.3: s += 15
-        elif h_diff <= 0.8: s += 8
-        
-    if pd.notna(row["風速"]):
-        w_diff = abs(float(row["風速"]) - inp["wind"])
-        if w_diff <= 1.5: s += 15
-        elif w_diff <= 3.0: s += 5
 
-    if pd.notna(row["気温"]):
-        t_diff = abs(float(row["気温"]) - inp["temp"])
-        if t_diff <= 2.0: s += 15
-        elif t_diff <= 4.5: s += 5
-        
+        if d <= 1.5:
+            s += 25
+        elif d <= 3:
+            s += 15
+
+    # ③ 潮の速さ
+    if clean(row["潮の速さ"]) == inp["speed"]:
+        s += 15
+
+    # ④ 当日の天気
+    if clean(row["天気"]) == inp["weather"]:
+        s += 10
+
+    # ⑤ 前日→当日の天気変化
+    # 過去データの「前日→当日」と
+    # 今回の予測日の「前日→当日」が一致したら加点
+    if df is not None:
+        target_pattern = inp.get("weather_pattern", "")
+
+        if target_pattern:
+            row_pattern = get_weather_pattern(
+                df,
+                row["日付"],
+                row["天気"]
+            )["pattern"]
+
+            if row_pattern == target_pattern:
+                s += 10
+
     return s
 
 def predict(df, inp, include_other=False):
     v = analysis_frame(df, include_other)
     if v.empty: return None
-    scored = [(idx, similarity(r, inp)) for idx,r in v.iterrows()]
+    inp["include_other"] = include_other    
+    scored = [
+        (idx, similarity(r, inp, df))
+        for idx, r in v.iterrows()]
     scored = sorted(scored, key=lambda x:x[1], reverse=True)[:10]
     rows = v.loc[[x[0] for x in scored]]
     w = np.array([max(1,x[1]) for x in scored], dtype=float)
@@ -296,9 +501,10 @@ def make_ranking(df, min_n=3, include_other=False):
     base = analysis_frame(df, include_other)
     if base.empty: return []
 
-    fields = ["潮回り", "月齢帯", "潮の速さ", "天気"]
+    fields = ["潮回り",  "潮の速さ", "天気"]
     work = base.copy()
     for c in fields: work[c] = work[c].map(clean)
+    df["天気"] = df["天気"].map(normalize_weather)
     work = work[~work[fields].isin(["", "不明"]).any(axis=1)].copy()
 
     out = []
@@ -358,7 +564,6 @@ class App(tk.Tk):
         self.vars = {
             "date": tk.StringVar(value=datetime.now().strftime("%Y/%m/%d")),
             "tide": tk.StringVar(value="中潮"),
-            "moon": tk.StringVar(value="17.4"),
             "weather": tk.StringVar(value="晴"),
             "speed": tk.StringVar(value="緩い"),
             "wave": tk.StringVar(value="0.5"),
@@ -370,7 +575,6 @@ class App(tk.Tk):
         fields=[
             ("予測日","date",None),
             ("潮回り","tide",TIDE_ORDER),
-            ("月齢","moon",None),
             ("天気","weather",WEATHER_OPTIONS),
             ("潮の速さ","speed",SPEED_OPTIONS),
             ("波高(m)","wave",None),
@@ -380,7 +584,30 @@ class App(tk.Tk):
         for label,key,opts in fields:
             f=tk.Frame(left,bg="white"); f.pack(fill="x",padx=20,pady=5)
             tk.Label(f,text=label,width=11,anchor="w",bg="white",fg="#586174",font=("Yu Gothic UI",10)).pack(side="left")
-            w=ttk.Combobox(f,textvariable=self.vars[key],values=opts,state="readonly",width=16) if opts else ttk.Entry(f,textvariable=self.vars[key],width=18)
+            if key == "date":
+                w = DateEntry(
+                    f,
+                    textvariable=self.vars[key],
+                    date_pattern="yyyy/mm/dd",
+                    width=17,
+                    background="white",
+                    foreground="black",
+                    borderwidth=1
+                )
+            elif opts:
+                w = ttk.Combobox(
+                    f,
+                    textvariable=self.vars[key],
+                    values=opts,
+                    state="readonly",
+                    width=17
+                )
+            else:
+                w = ttk.Entry(
+                    f,
+                    textvariable=self.vars[key],
+                    width=20
+                )
             w.pack(side="right")
             
         cb=tk.Checkbutton(left,text="飛翔（飛龍）の釣果も予測に含める",variable=self.include_other,command=self.refresh_rank,
@@ -458,15 +685,22 @@ class App(tk.Tk):
         if self.df.empty:
             messagebox.showwarning("データなし","先にCSVを読み込んでください。"); return
         try: 
-            moon=float(self.vars["moon"].get())
+            prediction_date = pd.to_datetime(self.vars["date"].get())
+            moon = calculate_moon_age(prediction_date)
+
             wave=float(self.vars["wave"].get())
             wind=float(self.vars["wind"].get())
             temp=float(self.vars["temp"].get())
         except ValueError:
             messagebox.showwarning("入力エラー","月齢・波高・風速・気温は数値で入力してください。"); return
-            
+
+        weather_info = get_weather_pattern(
+            self.df,
+            prediction_date,
+            self.vars["weather"].get()
+        )    
         inp={"tide":self.vars["tide"].get(),"moon":moon,"weather":self.vars["weather"].get(),
-             "speed":self.vars["speed"].get(),"wave":wave,"wind":wind,"temp":temp}
+             "speed":self.vars["speed"].get(),"wave":wave,"wind":wind,"temp":temp,"previous_weather": weather_info["previous"],"weather_pattern": weather_info["pattern"],"weather_change": weather_info["change_type"]}
              
         r=predict(self.df,inp,include_other=self.include_other.get())
         self.p20.config(text=f"{r['p20']:.0f}%"); self.mean.config(text=f"{r['low']:.0f}〜{r['high']:.0f}杯")
@@ -474,7 +708,21 @@ class App(tk.Tk):
         self.text.delete("1.0","end")
         mode="宝来丸＋飛翔" if self.include_other.get() else "宝来丸のみ"
         
-        self.text.insert("end",f"分析対象：{mode}\n入力条件\n{inp['tide']} × 月齢{moon} × {inp['weather']} × {inp['speed']} × 波高{wave}m × 風速{wind}m/s × 気温{temp}℃\n\n")
+        self.text.insert(
+            "end",
+            f"分析対象：{mode}\n"
+            f"予測日：{prediction_date.strftime('%Y/%m/%d')}\n"
+            f"潮回り：{inp['tide']}\n"
+            f"月齢：{moon:.1f}\n"
+            f"天気：{inp['weather']}\n"
+            f"前日の天気：{inp['previous_weather'] or 'データなし'}\n"
+            f"天気パターン：{inp['weather_pattern'] or '判定不可'}\n"
+            f"天気変化：{inp['weather_change']}\n"
+            f"潮の速さ：{inp['speed']}\n"
+            f"波高：{wave}m\n"
+            f"風速：{wind}m/s\n"
+            f"気温：{temp}℃\n\n"
+        )
         self.text.insert("end",f"20杯以上 {r['p20']:.1f}% / 30杯以上 {r['p30']:.1f}% / 40杯以上 {r['p40']:.1f}%\n")
         self.text.insert("end",f"信頼度 {r['confidence']:.0f}/100（類似件数・条件一致度・釣果のばらつきから算出）\n")
         self.text.insert("end",f"類似データ {len(r['rows'])}件 / 重み付き平均 {r['mean']:.1f}杯 / 中央値 {np.median(r['rows']['釣果']):.1f}杯\n")
